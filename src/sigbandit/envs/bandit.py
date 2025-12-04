@@ -19,12 +19,14 @@ class Bandit:
             self, 
             context_process: Context_Process,
             reward_fn: Callable[[Action, Context_Round], Reward], 
+            sigma: float,
             K: int, 
             T: int
     ):
         self._context_process = context_process
         self._reward_fn  = reward_fn
         self._t          = 0
+        self._sigma      = sigma
         self._n_actions  = K
         self._T          = T
 
@@ -41,8 +43,7 @@ class Bandit:
 
     def play(self, action) -> Reward:
         context = self.observe_context()
-        r = self._reward_fn(action, context)
-        #self.next_round()
+        r = self._reward_fn(action, context) + np.random.normal(0.0, self._sigma)
         return r
     
     def oracle(self):

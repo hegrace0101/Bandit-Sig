@@ -3,10 +3,10 @@ import numpy as np
 from ..utils.signature import compute_signature, time_augment, sig_length, sig_kernel
 
 class sigUCB:
-    def __init__(self, n_actions, lm, beta, N, d, sigType='sig', log_norm=False, fit_intercept=False):
+    def __init__(self, n_actions, lm, gamma, N, d, sigType='sig', log_norm=False, fit_intercept=False):
         self.K = int(n_actions)				        # number of arms (0,...,K-1)
         self.lm = float(lm)							# ridge regression penalty
-        self.beta = beta							# exploration parameter	
+        self.gamma = gamma							# exploration parameter	
         self.N = N 									# signature depth
         self.d = d									# dimension of path (including time-augmentation)
         self.sigType = sigType						# sig or log sig	
@@ -48,7 +48,7 @@ class sigUCB:
             Vinv = self._Vinv[a]
             mu = float(feat @ theta)                          # expected
             sd2 = np.max([0, float(feat @ (Vinv @ feat))])    # variance 
-            ucbs[a] = mu + self.beta * np.sqrt(sd2)
+            ucbs[a] = mu + self.gamma * np.sqrt(sd2)
 
         # select arm that maximizes ucb, randomly break ties
         m = ucbs.max()
@@ -79,10 +79,10 @@ class sigUCB:
 
 
 class linUCB:
-    def __init__(self, n_actions, lm, beta, n, log_norm=False, fit_intercept=False):
+    def __init__(self, n_actions, lm, gamma, n, log_norm=False, fit_intercept=False):
         self.K = int(n_actions)				        # number of arms (0,...,K-1)
         self.lm = float(lm)							# ridge regression penalty
-        self.beta = beta							# exploration parameter	
+        self.gamma = gamma							# exploration parameter	
         self.n = n									# number of points in window
         self.log_norm = log_norm                    # for gbm
         self.fit_intercept = bool(fit_intercept)	# fit intercept, do later?
@@ -116,7 +116,7 @@ class linUCB:
             Vinv = self._Vinv[a]
             mu = float(feat @ theta)              # expected
             sd2 = np.max([0, float(feat @ (Vinv @ feat))])     # variance 
-            ucbs[a] = mu + self.beta * np.sqrt(sd2)
+            ucbs[a] = mu + self.gamma * np.sqrt(sd2)
 
         # select arm that maximizes ucb, randomly break ties
         m = ucbs.max()

@@ -69,6 +69,25 @@ def ou(T, N, x0=0, d=1, mu=0, theta=1, sigma=1):
 
     return x
 
+
+def ou_stationary(T, N, d=1, mu=0, theta=1, sigma=1):
+    dt = float(T/N)
+
+    # initialize
+    x = np.zeros((N+1,d))
+
+    # draw from normal distibution 
+    var_stationary = sigma**2 / (2.0 * theta)
+    x[0] = mu + np.random.normal(scale=np.sqrt(var_stationary), size=d)
+
+    # Generate the OU process
+    for t in range(1, N+1):
+        dW =  np.random.normal(0, np.sqrt(dt), size=d)
+        x[t] = x[t-1] + theta * (mu - x[t-1]) * dt + sigma * dW
+
+    return x
+
+
 def gbm(T, N, x0=1, d=1, mu=0.1, sigma=0.43):
     dt = float(T/N)
 
@@ -89,33 +108,6 @@ def gaussian(T, N, d, cov):
     x = np.zeros((N, ))
 
 
-# ---------------------- Stationary Distributions ----------------------
-def unit_ball(T, N):
-    w = int(N/T)
-    d = 1
-
-    # sample vector from w-dimensional sphere T times
-    def sample_unit_ball(w):
-        z = np.random.normal(size=w)
-        nrm = np.linalg.norm(z)
-
-        # resample if needed
-        while nrm == 0.0:
-            z = np.random.normal(size=w)
-            nrm = np.linalg.norm(z)
-        u = z / nrm
-
-        # radius
-        r = np.random.uniform() ** (1.0 / w)
-        return  r * u
-
-    x = np.zeros((N+1,1), dtype=float)
-    for t in range(T):
-        u = sample_unit_ball(w)
-        x[t*w : (t+1)*w, 0] = u
-
-    return x
-
 
 if __name__ == "__main__":
     # test
@@ -124,9 +116,8 @@ if __name__ == "__main__":
     BM = bm(T, N)
     OU = ou(T, N)
     GBM = gbm(T, N)
-    UB = unit_ball(T, N)
 
-    context = ContextualProcess(UB, T, window)
+    context = ContextualProcess(BM, T, window)
 
     while context.next_round():
         print(context.observe_context())
