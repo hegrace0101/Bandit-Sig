@@ -21,7 +21,7 @@ N_total = 100 * 1000             # total points in full series
 window = N_total // T            # points per round
 
 lam = 1.0                        # ridge λ
-gamma = 2.0                      # exploration γ
+gamma = 1.0                      # exploration γ
 fit_intercept = False            # append constant 1.0 to features
 sigma = 0.1                      # standard deviation of reward noise
 
@@ -32,7 +32,7 @@ seeds = np.arange(n_runs) + 123  # reproducible seeds
 channels_after_time = raw_d + 1
 
 # K values to sweep over
-K_list = [2, 4, 8, 16]
+K_list = [2, 4, 8, 12, 16]
 
 # signature depths to sweep over
 depth_list = [1, 2, 3, 4]
@@ -81,7 +81,7 @@ def run_one(
     context = ContextualProcess(X, T, window)
 
     # bandit with reward function
-    bandit = Bandit(context, reward_fn, sigma, K, T)
+    bandit = Bandit(context, reward_fn, sigma, K, T, seed)
 
     # UCB over signature features
     sig_ucb = sigUCB(
@@ -147,11 +147,10 @@ def main(
             print(f"\n--- Running sigUCB experiments for K = {K} ---")
 
             if reward_name == "linear":
-                ctx_dim = window
-                rng_beta = np.random.RandomState(0)  # fixed seed across K/depth
-                beta_star = rng_beta.uniform(low=-1.0, high=1.0, size=(K, ctx_dim))
+                rng_beta = np.random.RandomState(0)  # fixed seed
+                beta_star = rng_beta.uniform(low=-1, high=1.0, size=(K, raw_d))
 
-                def reward_fn(action: int, ctx: np.ndarray, beta_star=beta_star) -> float:
+                def reward_fn(action: int, ctx: np.ndarray) -> float:
                     return linear_reward(action, ctx, beta_star)
             else:
                 reward_fn = REWARD_MAP[reward_name]
@@ -191,24 +190,33 @@ def main(
     # ------------------------- plot: regret at time T vs K, multiple depths -------------------------
     plt.figure(figsize=(7, 5))
 
-    colors = plt.cm.viridis(np.linspace(0, 1, len(depth_list)))
+    # default Matplotlib color cycle (more readable than viridis here)
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    # different marker per depth
+    markers = ["o", "s", "^", "D", "v", "P", "X", "*"]
+
+    K_arr = np.array(K_list, dtype=float)
+    sqrtK = np.sqrt(K_arr)
 
     for i, sig_depth in enumerate(depth_list):
         med = final_med[sig_depth]
         plt.plot(
-            K_list,
+            sqrtK,
             med,
-            marker="o",
+            marker=markers[i % len(markers)],
             linestyle="-",
-            color=colors[i],
+            color=colors[i % len(colors)],
+            linewidth=2,
+            markersize=7,
             label=f"N={sig_depth}",
         )
 
-    plt.xlabel("Number of actions K")
+    plt.xlabel(r"$\sqrt{K}$")
     plt.ylabel(f"Median Cumulative Regret at T={T} (sigUCB)")
     plt.title(
-        f"sigUCB Regret vs K\n"
-        f"({process}, {reward_name}, γ={gamma}, λ={lam}, sig_type={sig_type})"
+        f"Regret vs K\n"
+        f"({process}, {reward_name}, λ={lam}, γ={gamma})"
     )
     plt.legend()
     plt.tight_layout()
@@ -224,4 +232,4 @@ def main(
 
 
 if __name__ == "__main__":
-    main(process="bm", reward_name="linear", sig_type="sig")
+    main(process="ou_s", reward_name="min_max_mix", sig_type="sig")

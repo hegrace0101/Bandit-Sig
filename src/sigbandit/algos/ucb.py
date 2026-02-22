@@ -3,7 +3,7 @@ import numpy as np
 from ..utils.signature import compute_signature, time_augment, sig_length, sig_kernel
 
 class sigUCB:
-    def __init__(self, n_actions, lm, gamma, N, d, sigType='sig', log_norm=False, fit_intercept=False):
+    def __init__(self, n_actions, lm, gamma, N, d, sigType='sig', log_norm=False, fit_intercept=False, seed=0):
         self.K = int(n_actions)				        # number of arms (0,...,K-1)
         self.lm = float(lm)							# ridge regression penalty
         self.gamma = gamma							# exploration parameter	
@@ -19,7 +19,8 @@ class sigUCB:
         self._Vinv  = [np.eye(self._dim) / self.lm  for _ in range(self.K)]
         self._b     = [np.zeros(self._dim)          for _ in range(self.K)]
         self._theta = [np.zeros(self._dim)          for _ in range(self.K)]
-        
+
+        self.rng = np.random.default_rng(seed)
 
     def sig_feat(self, context):
         # save initial condition for sig feature
@@ -53,7 +54,7 @@ class sigUCB:
         # select arm that maximizes ucb, randomly break ties
         m = ucbs.max()
         ties = np.flatnonzero(np.isclose(ucbs, m))
-        return int(np.random.choice(ties))
+        return int(self.rng.choice(ties))
     
 
     def update(self, context, action, reward):
@@ -79,7 +80,7 @@ class sigUCB:
 
 
 class linUCB:
-    def __init__(self, n_actions, lm, gamma, n, log_norm=False, fit_intercept=False):
+    def __init__(self, n_actions, lm, gamma, n, log_norm=False, fit_intercept=False, seed=0):
         self.K = int(n_actions)				        # number of arms (0,...,K-1)
         self.lm = float(lm)							# ridge regression penalty
         self.gamma = gamma							# exploration parameter	
@@ -93,6 +94,7 @@ class linUCB:
         self._b     = [np.zeros(self.n)          for _ in range(self.K)]
         self._theta = [np.zeros(self.n)          for _ in range(self.K)]
 
+        self.rng = np.random.default_rng(seed)
     
     def lin_feat(self, context):
         feat = context[:,0]
@@ -121,7 +123,7 @@ class linUCB:
         # select arm that maximizes ucb, randomly break ties
         m = ucbs.max()
         ties = np.flatnonzero(np.isclose(ucbs, m))
-        return int(np.random.choice(ties))
+        return int(self.rng.choice(ties))
     
 
     def update(self, context, action, reward):

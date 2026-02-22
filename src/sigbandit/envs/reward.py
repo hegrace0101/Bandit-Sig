@@ -23,5 +23,5 @@ def sum_a_reward(action: int, ctx: np.ndarray) -> float:
 
 
 def linear_reward(action: int, ctx: np.ndarray, beta: np.ndarray) -> float:
-    ctx = ctx.reshape(-1)
-    return ctx @ beta[action]
+    return float((ctx @ beta[action]).sum()/len(ctx))
+

@@ -5,7 +5,7 @@ import os
 
 from sigbandit.algos.ucb import sigUCB, linUCB
 from sigbandit.envs.bandit import Bandit
-from sigbandit.envs.context import ContextualProcess, bm, ou, ou_stationary, gbm
+from sigbandit.envs.context import ContextualProcess, bm, ou, ou_stationary, gbm, frac_bm
 from sigbandit.envs.reward import min_max_reward, sum_a_reward, linear_reward
 from tqdm import tqdm
 
@@ -13,11 +13,11 @@ from tqdm import tqdm
 T = 100                          # rounds per run
 K = 2                            # actions
 raw_d = 1                        # raw channels (before time-augment)
-N_total = 100 * 1000             # total points in full series
+N_total = 100*1000               # total points in full series
 window = N_total // T            # points per round
 
 lam = 1.0                        # ridge λ
-gamma = 2.0                    	 # exploration γ
+gamma = 1.0                    	 # exploration γ
 fit_intercept = False            # append constant 1.0 to features
 sigma = 0.1                      # standard deviation of reward noise
 
@@ -32,7 +32,8 @@ PROCESS_MAP = {
     "bm": bm,
     "ou": ou,
     "ou_s": ou_stationary,
-    "gbm": gbm
+    "gbm": gbm,
+    "fbm": frac_bm
 }
 
 # available reward functions
@@ -68,7 +69,7 @@ def run_one(
     context = ContextualProcess(X, T, window)
 
     # bandit with reward function
-    bandit = Bandit(context, reward_fn, sigma, K, T)
+    bandit = Bandit(context, reward_fn, sigma, K, T, seed)
 
     # UCB over signature features
     sig_ucb = sigUCB(
@@ -130,9 +131,8 @@ def main(process: str = "bm", reward_name: str = "min_max", sig_type: str = "log
     process_fn = PROCESS_MAP[process]
 
     if reward_name == "linear":
-        ctx_dim = window
         rng_beta = np.random.RandomState(0)  # fixed seed
-        beta_star = rng_beta.uniform(low=-1.0, high=1.0, size=(K, ctx_dim))
+        beta_star = rng_beta.uniform(low=-1, high=1.0, size=(K, raw_d))
 
         def reward_fn(action: int, ctx: np.ndarray) -> float:
             return linear_reward(action, ctx, beta_star)
@@ -177,8 +177,8 @@ def main(process: str = "bm", reward_name: str = "min_max", sig_type: str = "log
     plt.xlabel("Round")
     plt.ylabel("Cumulative Regret")
     plt.title(
-        f"SigUCB Cumulative Regret (process={process}, reward={reward_name}, "
-        f"K={K}, depth={sig_depth}, γ={gamma}, λ={lam}, sig_type={sig_type})"
+        f"Cumulative Regret ({process}, {reward_name}, "
+        f"K={K}, depth={sig_depth}, λ={lam}, γ={gamma})"
     )
     plt.legend()
     plt.tight_layout()
@@ -193,4 +193,4 @@ def main(process: str = "bm", reward_name: str = "min_max", sig_type: str = "log
     plt.close()
 
 if __name__ == "__main__":
-    main(process="ou_s", reward_name='linear', sig_type="logsig", sig_depth=1)
+    main(process="fbm", reward_name='min_max', sig_type="sig", sig_depth=1)

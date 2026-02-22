@@ -21,7 +21,8 @@ class Bandit:
             reward_fn: Callable[[Action, Context_Round], Reward], 
             sigma: float,
             K: int, 
-            T: int
+            T: int,
+            seed: int
     ):
         self._context_process = context_process
         self._reward_fn  = reward_fn
@@ -29,6 +30,9 @@ class Bandit:
         self._sigma      = sigma
         self._n_actions  = K
         self._T          = T
+        self._eps_t      = 0.0
+        self._rng        = np.random.default_rng(seed)
+
 
     def next_round(self) -> bool:
         if self._t + 1 > self._T:
@@ -36,6 +40,7 @@ class Bandit:
         else:
             self._t += 1
             self._context_process.next_round()
+            self._eps_t = self._rng.normal(0.0, self._sigma)
             return True
 
     def observe_context(self) -> Context_Round:
@@ -43,7 +48,7 @@ class Bandit:
 
     def play(self, action) -> Reward:
         context = self.observe_context()
-        r = self._reward_fn(action, context) + np.random.normal(0.0, self._sigma)
+        r = self._reward_fn(action, context) + self._eps_t
         return r
     
     def oracle(self):
@@ -83,7 +88,7 @@ if __name__ == "__main__":
     context = ContextualProcess(BM, T, window)
 
     # intialize bandit
-    bandit = Bandit(context, min_max_reward, 2, T)
+    bandit = Bandit(context, min_max_reward, 2, T, seed=0)
 
     # run rounds
     round = 1
