@@ -1,4 +1,5 @@
 import numpy as np
+from typing import Callable
 
 class KernelUCB:
     """
@@ -22,6 +23,7 @@ class KernelUCB:
         poly_deg: int = 2,
         poly_c: float = 1.0,
         max_points: int | None = None,
+        log_norm: bool = False,
         seed: int = 0,
     ):
         self.K = int(n_actions)
@@ -34,12 +36,20 @@ class KernelUCB:
         self.poly_c = float(poly_c)
 
         self.max_points = max_points
+        self.log_norm = bool(log_norm)
         self.rng = np.random.default_rng(seed)
 
         # per-arm memory
         self.X = [[] for _ in range(self.K)]         # list of (d,) arrays
         self.y = [[] for _ in range(self.K)]         # list of scalars
         self.Kinv = [None for _ in range(self.K)]    # (n,n) inverse of (Gram + lam I)
+
+
+    def _prep_x(self, context: np.ndarray) -> np.ndarray:
+        x = np.asarray(context, dtype=float).ravel()
+        if self.log_norm:
+            x = np.log(x / x[0])
+        return np.ascontiguousarray(x, dtype=float)
 
     # ---------- kernels ----------
     def _k(self, x: np.ndarray, z: np.ndarray) -> float:
@@ -113,7 +123,7 @@ class KernelUCB:
 
     # ---------- bandit API ----------
     def select(self, context: np.ndarray) -> int:
-        x = np.ascontiguousarray(np.asarray(context, dtype=float).ravel())
+        x = self._prep_x(context)
 
         ucbs = np.zeros(self.K, dtype=float)
         for a in range(self.K):
@@ -133,14 +143,24 @@ class KernelUCB:
 
             ucbs[a] = mu + self.gamma * np.sqrt(s2)
 
-        m = ucbs.max()
-        ties = np.flatnonzero(np.isclose(ucbs, m))
+        # if not np.isfinite(ucbs).all():
+        #     finite = np.isfinite(ucbs)
+        #     if finite.any():
+        #         return int(np.argmax(np.where(finite, ucbs, -np.inf)))
+        #     return int(self.rng.integers(self.K))
+
+        m = np.nanmax(ucbs)
+        if np.isnan(m):
+            return int(self.rng.integers(self.K))
+        ties = np.flatnonzero(ucbs == m)
+        if ties.size == 0:
+            return int(self.rng.integers(self.K))
         return int(self.rng.choice(ties))
 
 
     def update(self, context: np.ndarray, action: int, reward: float) -> None:
         a = int(action)
-        x = np.ascontiguousarray(np.asarray(context, dtype=float).ravel())
+        x = self._prep_x(context)
         r = float(reward)
 
         X_a = self.X[a]

@@ -1,4 +1,4 @@
-# src/sigbandit/tests/temp_sensor_exp/data_prep.py
+# src/sigbandit/tests/temp_sensor_exp/load_data.py
 import numpy as np
 import pandas as pd
 

@@ -1,6 +1,6 @@
 from typing import Callable
-from .context import ContextualProcess, bm, ou, gbm
-from .reward import min_max_reward, sum_a_reward
+from .context import ContextualProcess, bm, ou_stationary, gbm
+from .reward import min_max_reward
 import numpy as np
 
 Context_Process = ContextualProcess

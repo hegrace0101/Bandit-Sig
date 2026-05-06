@@ -1,4 +1,4 @@
-# src/sigbandit/envs/intel_temp_bandit.py
+# src/sigbandit/envs/temp_sensor_bandit.py
 import numpy as np
 
 class TempSensorBandit:
@@ -43,7 +43,7 @@ class TempSensorBandit:
         sl = self._window_slice()
         anchor_path = self.X[sl][:, self.anchors]
         tod_path = self.X[sl][:, self.K:self.K+2]
-        return np.concatenate([anchor_path, tod_path], axis=1)
+        return anchor_path #np.concatenate([anchor_path, tod_path], axis=1)
 
 
     def reward(self, action: int) -> float:

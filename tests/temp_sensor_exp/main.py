@@ -1,11 +1,10 @@
-# src/sigbandit/tests/temp_sensor_intel.py
+# tests/temp_sensor_exp/main.py
 import numpy as np
 import os
 import matplotlib.pyplot as plt
 
 from sigbandit.algos.ucb import sigUCB, linUCB
 from sigbandit.algos.kernel_ucb import KernelUCB
-from sigbandit.algos.nonstationary_ucb import SWLinUCB
 from tests.temp_sensor_exp.load_data import load_intel_temp_matrix
 from sigbandit.envs.temp_sensor_bandit import TempSensorBandit
 from tqdm import tqdm
@@ -47,7 +46,6 @@ def _krr_fit_predict_rbf(Xtr, Ytr, Xva, sigma: float, lam: float):
     Kvt = _rbf_kernel(Xva, Xtr, sigma)                  # (n_va, n_tr)
     return Kvt @ alpha                                  # (n_va, K)
 
-
 # ------------------------- warmup data collection -------------------------
 
 def _collect_warmup_fullinfo(env: TempSensorBandit, K: int, window_L: int, warmup_hours: int):
@@ -59,7 +57,7 @@ def _collect_warmup_fullinfo(env: TempSensorBandit, K: int, window_L: int, warmu
 
     After return: env is positioned at hour = warmup_hours (i.e., advanced warmup_hours times).
     """
-    ctx_wins, X2, Y = [], [], []
+    ctx_wins, ctx_avgs, Y = [], [], []
 
     for _ in range(warmup_hours):
         if not env.next_round():
@@ -70,8 +68,7 @@ def _collect_warmup_fullinfo(env: TempSensorBandit, K: int, window_L: int, warmu
         if ctx_win_h.shape[0] != window_L:
             break
 
-        tod_path = ctx_win_h[:, -2:]
-        x2_h = tod_path.mean(axis=0)
+        ctx_avg_h = ctx_win_h.mean(axis=0)
 
         # move to hour h+1 for label evaluation
         env.step_time()
@@ -84,22 +81,19 @@ def _collect_warmup_fullinfo(env: TempSensorBandit, K: int, window_L: int, warmu
             y_next[a] = env.reward(a)
 
         ctx_wins.append(ctx_win_h)
-        X2.append(x2_h)
+        ctx_avgs.append(ctx_avg_h)
         Y.append(y_next)
 
-    if len(X2) == 0:
-        return [], np.zeros((0, 2)), np.zeros((0, K))
-
-    return ctx_wins, np.stack(X2, axis=0), np.stack(Y, axis=0)
+    return ctx_wins, np.stack(ctx_avgs, axis=0), np.stack(Y, axis=0)
 
 
 # ---------------------- stage 1: model selection (simple CV) ----------------------
-def _select_lin_lam(X2, Y, lam_grid, val_hours=6):
-    n = len(X2)
+def _select_lin_lam(ctx_avgs, Y, lam_grid, val_hours=6):
+    n = len(ctx_avgs)
     n_va = min(val_hours, max(1, n // 4))
     n_tr = n - n_va
-    Xtr, Ytr = X2[:n_tr], Y[:n_tr]
-    Xva, Yva = X2[n_tr:], Y[n_tr:]
+    Xtr, Ytr = ctx_avgs[:n_tr], Y[:n_tr]
+    Xva, Yva = ctx_avgs[n_tr:], Y[n_tr:]
 
     best = None
     for lam in lam_grid:
@@ -126,10 +120,12 @@ def _select_sig_N_lam(ctx_wins, Y, K, adds_time, sig_type, N_grid, lam_grid, val
             lm=1.0,
             gamma=1.0,
             N=N,
-            d=(ctx_wins[0].shape[1] + (1 if adds_time else 0)),
+            d=(ctx_wins[0].shape[1]),
             sigType=sig_type,
             log_norm=False,
             fit_intercept=True,
+            prune_end_time=True,
+            time_augment_bool=adds_time,
         )
 
         Phi = []
@@ -150,12 +146,12 @@ def _select_sig_N_lam(ctx_wins, Y, K, adds_time, sig_type, N_grid, lam_grid, val
     _, Nbest, lambest = best
     return Nbest, lambest
 
-def _select_kernel_sigma_lam(X2, Y, sigma_grid, lam_grid, val_hours=6):
-    n = len(X2)
+def _select_kernel_sigma_lam(ctx_avgs, Y, sigma_grid, lam_grid, val_hours=6):
+    n = len(ctx_avgs)
     n_va = min(val_hours, max(1, n // 4))
     n_tr = n - n_va
-    Xtr, Ytr = X2[:n_tr], Y[:n_tr]
-    Xva, Yva = X2[n_tr:], Y[n_tr:]
+    Xtr, Ytr = ctx_avgs[:n_tr], Y[:n_tr]
+    Xva, Yva = ctx_avgs[n_tr:], Y[n_tr:]
 
     best = None
     for sigma in sigma_grid:
@@ -169,19 +165,19 @@ def _select_kernel_sigma_lam(X2, Y, sigma_grid, lam_grid, val_hours=6):
 
 
 # ------------------------- Stage-2: tune gamma via offline replay regret -------------------------
-
-def _replay_lin_ucb(X2, Y, K, lam, gamma):
+def _replay_lin_ucb(ctx_avgs, Y, K, lam, gamma):
+    p = ctx_avgs.shape[1]    
     lin = linUCB(
         n_actions=K,
         lm=float(lam),
         gamma=float(gamma),
-        n=2,
+        n=p,
         log_norm=False,
         fit_intercept=True,
     )
     cum = 0.0
-    for t in range(len(X2)):
-        ctx_lin = np.ascontiguousarray(X2[t], dtype=float)[:, None]  # (2,1)
+    for t in range(len(ctx_avgs)):
+        ctx_lin = np.ascontiguousarray(ctx_avgs[t], dtype=float)[:, None]  # (2,1)
         a = lin.select(ctx_lin)
         r = float(Y[t, a])
         oracle = float(np.max(Y[t]))
@@ -197,10 +193,12 @@ def _replay_sig_ucb(ctx_wins, Y, K, adds_time, sig_type, N, lam, gamma):
         lm=float(lam),
         gamma=float(gamma),
         N=int(N),
-        d=int(d_ctx + (1 if adds_time else 0)),
+        d=int(d_ctx),
         sigType=sig_type,
         log_norm=False,
         fit_intercept=True,
+        prune_end_time=True,
+        time_augment_bool=adds_time,
     )
     cum = 0.0
     for t in range(len(ctx_wins)):
@@ -213,7 +211,7 @@ def _replay_sig_ucb(ctx_wins, Y, K, adds_time, sig_type, N, lam, gamma):
     return cum
 
 
-def _replay_kernel_ucb(X2, Y, K, sigma, lam, gamma, seed=0):
+def _replay_kernel_ucb(ctx_avgs, Y, K, sigma, lam, gamma, seed=0):
     ker = KernelUCB(
         n_actions=K,
         lm=float(lam),
@@ -224,40 +222,20 @@ def _replay_kernel_ucb(X2, Y, K, sigma, lam, gamma, seed=0):
         seed=int(seed),
     )
     cum = 0.0
-    for t in range(len(X2)):
-        x2 = np.ascontiguousarray(X2[t], dtype=float)
-        a = ker.select(x2)
+    for t in range(len(ctx_avgs)):
+        x = np.ascontiguousarray(ctx_avgs[t], dtype=float)
+        a = ker.select(x)
         r = float(Y[t, a])
         oracle = float(np.max(Y[t]))
-        ker.update(x2, a, r)
-        cum += (oracle - r)
-    return cum
-
-def _replay_swlin_ucb(X2, Y, K, lam, gamma, w, seed=0):
-    sw = SWLinUCB(
-        n_actions=K,
-        n=2,
-        w=int(w),
-        lm=float(lam),
-        gamma=float(gamma),
-        fit_intercept=True,
-        seed=seed,
-    )
-    cum = 0.0
-    for t in range(len(X2)):
-        x = np.ascontiguousarray(X2[t], dtype=float)  # (2,)
-        a = sw.select(x)
-        r = float(Y[t, a])
-        oracle = float(np.max(Y[t]))
-        sw.update(x, a, r)
+        ker.update(x, a, r)
         cum += (oracle - r)
     return cum
 
 
-def _tune_gamma_lin(X2, Y, K, lam, gamma_grid):
+def _tune_gamma_lin(ctx_avgs, Y, K, lam, gamma_grid):
     best = None
     for g in gamma_grid:
-        reg = _replay_lin_ucb(X2, Y, K=K, lam=lam, gamma=g)
+        reg = _replay_lin_ucb(ctx_avgs, Y, K=K, lam=lam, gamma=g)
         if best is None or reg < best[0]:
             best = (reg, g)
     return best[1]
@@ -272,24 +250,13 @@ def _tune_gamma_sig(ctx_wins, Y, K, adds_time, sig_type, N, lam, gamma_grid):
     return best[1]
 
 
-def _tune_gamma_kernel(X2, Y, K, sigma, lam, gamma_grid, seed=0):
+def _tune_gamma_kernel(ctx_avgs, Y, K, sigma, lam, gamma_grid, seed=0):
     best = None
     for g in gamma_grid:
-        reg = _replay_kernel_ucb(X2, Y, K=K, sigma=sigma, lam=lam, gamma=g, seed=seed)
+        reg = _replay_kernel_ucb(ctx_avgs, Y, K=K, sigma=sigma, lam=lam, gamma=g, seed=seed)
         if best is None or reg < best[0]:
             best = (reg, g)
     return best[1]
-
-
-def _tune_gamma_w_swlin(X2, Y, K, lam, gamma_grid, w_grid, seed=0):
-    best = None
-    for w in w_grid:
-        for g in gamma_grid:
-            reg = _replay_swlin_ucb(X2, Y, K=K, lam=lam, gamma=g, w=w, seed=seed)
-            if best is None or reg < best[0]:
-                best = (reg, w, g)
-    _, wbest, gbest = best
-    return int(wbest), float(gbest)
 
 
 # ------------------------- main experiment: warmup + bandit -------------------------
@@ -324,19 +291,34 @@ def run_one_intel(
         seed=seed,
     )
 
+    def _window_stats(env_obj):
+        sl = env_obj._window_slice()
+        field = env_obj.X[sl, :env_obj.K]  # (L, K)
+
+        if env_obj.reward_mode == "max":
+            per_sensor_stat = np.max(field, axis=0)   # (K,)
+            true_stat = float(np.max(field))
+        elif env_obj.reward_mode == "avg":
+            per_sensor_stat = np.mean(field, axis=0)  # (K,)
+            true_stat = float(np.mean(field))
+        else:
+            raise ValueError(f"Unknown reward_mode={env_obj.reward_mode!r}")
+
+        return true_stat, per_sensor_stat
+
     # ---------- warmup: collect full-info labels ----------
-    ctx_wins, X2, Y = _collect_warmup_fullinfo(env, K=K, window_L=window_L, warmup_hours=warmup_hours)
+    ctx_wins, ctx_avgs, Y = _collect_warmup_fullinfo(env, K=K, window_L=window_L, warmup_hours=warmup_hours)
 
     # ---------- Stage 1: supervised model selection on warmup (pick lam/N/sigma) ----------
     Yc = Y - Y.mean(axis=0, keepdims=True)
     Ys = Yc / (Yc.std(axis=0, keepdims=True) + 1e-8)
 
     if do_model_select and len(ctx_wins) >= 8:
-        lam_grid = [1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0, 1e3, 1e4, 1e5]
-        N_grid     = [2, 3, 4]
-        sigma_grid = [0.1, 0.2, 0.5, 1.0, 2.0]
+        lam_grid   = [1e-10, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 5.0, 10.0, 100.0]
+        N_grid     = [1, 2]
+        sigma_grid = [0.1, 1.0, 2.0, 5.0, 10.0]
 
-        lin_lam = _select_lin_lam(X2, Ys, lam_grid=lam_grid, val_hours=6)
+        lin_lam = _select_lin_lam(ctx_avgs, Ys, lam_grid=lam_grid, val_hours=6)
 
         sig_N, sig_lam = _select_sig_N_lam(
             ctx_wins, Ys, K=K, adds_time=adds_time, sig_type=sig_type,
@@ -344,34 +326,34 @@ def run_one_intel(
         )
 
         ker_sigma, ker_lam = _select_kernel_sigma_lam(
-            X2, Ys, sigma_grid=sigma_grid, lam_grid=lam_grid, val_hours=6
+            ctx_avgs, Ys, sigma_grid=sigma_grid, lam_grid=lam_grid, val_hours=6
         )
 
         # ---------- Stage 2: offline bandit replay tuning for gamma (with stage-1 hypers frozen) ----------
-        gamma_grid = [1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0]
-        w_grid     = [8, 12, 24, 48, 72]   # in bandit rounds (≈ hours)
+        gamma_grid = [1e-10, 1e-4, 1e-3, 1e-2, 0.1, 0.3, 1.0, 3.0]
 
-        lin_gamma = _tune_gamma_lin(X2, Y, K=K, lam=lin_lam, gamma_grid=gamma_grid)
+        lin_gamma = _tune_gamma_lin(ctx_avgs, Y, K=K, lam=lin_lam, gamma_grid=gamma_grid)
 
         sig_gamma = _tune_gamma_sig(
             ctx_wins, Y, K=K, adds_time=adds_time, sig_type=sig_type,
             N=sig_N, lam=sig_lam, gamma_grid=gamma_grid
         )
 
-        ker_gamma = _tune_gamma_kernel(X2, Y, K=K, sigma=ker_sigma, lam=ker_lam, gamma_grid=gamma_grid, seed=seed)
-
-        sw_w, sw_gamma = _tune_gamma_w_swlin(X2, Y, K=K, lam=lin_lam, gamma_grid=gamma_grid, w_grid=w_grid, seed=seed)
+        ker_gamma = _tune_gamma_kernel(ctx_avgs, Y, K=K, sigma=ker_sigma, lam=ker_lam, gamma_grid=gamma_grid, seed=seed)
 
         # print('LinUCB:', lin_lam, lin_gamma)
         # print('SigUCB:', sig_N, sig_lam, sig_gamma)
         # print('KerUCB:', ker_sigma, ker_lam, ker_gamma)
-        # print("SW-LinUCB:", lin_lam, sw_w, sw_gamma)
 
     else:
         lin_lam, lin_gamma = lam, gamma
         sig_N, sig_lam, sig_gamma = sig_depth, lam, gamma
         ker_sigma, ker_lam, ker_gamma = 0.5, lam, gamma
-        sw_w, sw_gamma = 24, gamma
+
+    # print(
+    #     f"[seed={seed}] chosen signature depth N={sig_N} | "
+    #     f"sig_lam={sig_lam} | sig_gamma={sig_gamma}"
+    # )
 
 
     # ---------- init learners with chosen hyperparams ----------
@@ -387,18 +369,20 @@ def run_one_intel(
         lm=float(sig_lam), 
         gamma=float(sig_gamma),
         N=int(sig_N), 
-        d=int(d_ctx + (1 if adds_time else 0)),
+        d=int(d_ctx),
         sigType=sig_type, 
         log_norm=False, 
         fit_intercept=True,
         seed=seed,
+        prune_end_time=True,
+        time_augment_bool=adds_time,
     )
 
     lin_ucb = linUCB(
         n_actions=K, 
         lm=float(lin_lam), 
         gamma=float(lin_gamma),
-        n=2, 
+        n=d_ctx, 
         log_norm=False, 
         fit_intercept=True,
         seed=seed,
@@ -414,35 +398,24 @@ def run_one_intel(
         seed=seed,
     )
 
-    sw_lin_ucb = SWLinUCB(
-        n_actions=K,
-        n=2,
-        w=sw_w,
-        lm=float(lin_lam),
-        gamma=float(sw_gamma),
-        fit_intercept=True,
-        seed=seed,
-    )
-
     # ---------- bandit phase (remaining data): pending / next-hour evaluation ----------
-    sig_reg, lin_reg, ker_reg, sw_reg = [], [], [], []
-    sig_err, lin_err, ker_err, sw_err, oracle_err = [], [], [], [], []
-    sig_cum = lin_cum = ker_cum = sw_cum = 0.0
+    sig_reg, lin_reg, ker_reg = [], [], []
+    sig_err, lin_err, ker_err = [], [], []
+    sig_cum = lin_cum = ker_cum = 0.0
+    sig_chosen_stat, lin_chosen_stat, ker_chosen_stat = [], [], []
+    true_stat_series = []
 
-    pending = None  # (ctx_win_t, ctx_lin_t, x2_t, a_sig_t, a_lin_t, a_ker_t)
+    pending = None 
 
     while env.next_round():
         ctx_win = np.ascontiguousarray(env.observe_context_window(), dtype=np.float64)   # hour t window
-        tod_path = ctx_win[:, -2:]
-        x2 = tod_path.mean(axis=0)                  # (2,)
-        ctx_lin = x2[:, None]                       # (2,1)
+        ctx_avg = ctx_win.mean(axis=0)
+        ctx_lin = ctx_avg[:, None]
 
         # choose actions for next hour
         a_sig = sig_ucb.select(ctx_win)
         a_lin = lin_ucb.select(ctx_lin)
-        a_ker = ker_ucb.select(x2)
-        a_sw = sw_lin_ucb.select(x2)
-
+        a_ker = ker_ucb.select(ctx_avg)
 
         # move to hour t+1 (evaluation window)
         env.step_time()
@@ -450,10 +423,16 @@ def run_one_intel(
             break
 
         if pending is not None:
-            ctxw_prev, ctxlin_prev, x2_prev, as_prev, al_prev, ak_prev, aw_prev = pending
+            ctxw_prev, ctxlin_prev, ctx_avg_prev, as_prev, al_prev, ak_prev = pending
+
+            true_stat, per_sensor_stat = _window_stats(env)
+
+            true_stat_series.append(true_stat)
+            sig_chosen_stat.append(float(per_sensor_stat[as_prev]))
+            lin_chosen_stat.append(float(per_sensor_stat[al_prev]))
+            ker_chosen_stat.append(float(per_sensor_stat[ak_prev]))
 
             oracle_r, _ = env.oracle()
-            oracle_err.append(-oracle_r)
 
             r_sig = env.reward(as_prev)
             sig_ucb.update(ctxw_prev, as_prev, r_sig)
@@ -468,22 +447,18 @@ def run_one_intel(
             lin_err.append(-r_lin)
 
             r_ker = env.reward(ak_prev)
-            ker_ucb.update(x2_prev, ak_prev, r_ker)
+            ker_ucb.update(ctx_avg_prev, ak_prev, r_ker)
             ker_cum += (oracle_r - r_ker)
             ker_reg.append(ker_cum)
             ker_err.append(-r_ker)
 
-            r_sw = env.reward(aw_prev)
-            sw_lin_ucb.update(x2_prev, aw_prev, r_sw)
-            sw_cum += (oracle_r - r_sw)
-            sw_reg.append(sw_cum)
-            sw_err.append(-r_sw)
-
-        pending = (ctx_win, ctx_lin, x2, a_sig, a_lin, a_ker, a_sw)
+        pending = (ctx_win, ctx_lin, ctx_avg, a_sig, a_lin, a_ker)
 
     return (
-        np.array(sig_reg), np.array(lin_reg), np.array(ker_reg), np.array(sw_reg),
-        np.array(sig_err), np.array(lin_err), np.array(ker_err), np.array(sw_err), np.array(oracle_err),
+        np.array(sig_reg), np.array(lin_reg), np.array(ker_reg),
+        np.array(sig_err), np.array(lin_err), np.array(ker_err),
+        np.array(sig_chosen_stat), np.array(lin_chosen_stat), np.array(ker_chosen_stat),
+        np.array(true_stat_series),
     )
 
 def main(
@@ -522,76 +497,81 @@ def main(
         )
     ]
 
-    # unpack + stack (safe against length mismatches)
+    # unpack
     sig_list = [r[0] for r in runs]
     lin_list = [r[1] for r in runs]
     ker_list = [r[2] for r in runs]
-    sw_list = [r[3] for r in runs]
-    sig_err_list = [r[4] for r in runs]
-    lin_err_list = [r[5] for r in runs]
-    ker_err_list = [r[6] for r in runs]
-    sw_err_list  = [r[7] for r in runs]
-    orc_err_list = [r[8] for r in runs]
+    sig_err_list = [r[3] for r in runs]
+    lin_err_list = [r[4] for r in runs]
+    ker_err_list = [r[5] for r in runs]
+    sig_stat_list = [r[6] for r in runs]
+    lin_stat_list = [r[7] for r in runs]
+    ker_stat_list = [r[8] for r in runs]
+    true_stat_list = [r[9] for r in runs]
 
     min_len = min(
         min(len(r) for r in sig_list),
         min(len(r) for r in lin_list),
         min(len(r) for r in ker_list),
-        min(len(r) for r in sw_list),
         min(len(r) for r in sig_err_list),
         min(len(r) for r in lin_err_list),
         min(len(r) for r in ker_err_list),
-        min(len(r) for r in sw_err_list),
-        min(len(r) for r in orc_err_list),
+        min(len(r) for r in sig_stat_list),
+        min(len(r) for r in lin_stat_list),
+        min(len(r) for r in ker_stat_list),
+        min(len(r) for r in true_stat_list),
     )
 
     all_sig = np.stack([r[:min_len] for r in sig_list], axis=0)
     all_lin = np.stack([r[:min_len] for r in lin_list], axis=0)
     all_ker = np.stack([r[:min_len] for r in ker_list], axis=0)
-    all_sw = np.stack([r[:min_len] for r in sw_list], axis=0)
 
     all_sig_err = np.stack([r[:min_len] for r in sig_err_list], axis=0)
     all_lin_err = np.stack([r[:min_len] for r in lin_err_list], axis=0)
     all_ker_err = np.stack([r[:min_len] for r in ker_err_list], axis=0)
-    all_sw_err  = np.stack([r[:min_len] for r in sw_err_list], axis=0)
-    all_orc_err = np.stack([r[:min_len] for r in orc_err_list], axis=0)
+
+    all_sig_stat = np.stack([r[:min_len] for r in sig_stat_list], axis=0)
+    all_lin_stat = np.stack([r[:min_len] for r in lin_stat_list], axis=0)
+    all_ker_stat = np.stack([r[:min_len] for r in ker_stat_list], axis=0)
+    all_true_stat = np.stack([r[:min_len] for r in true_stat_list], axis=0)
 
     sig_med, sig_p25, sig_p75 = np.median(all_sig, 0), np.percentile(all_sig, 25, 0), np.percentile(all_sig, 75, 0)
     lin_med, lin_p25, lin_p75 = np.median(all_lin, 0), np.percentile(all_lin, 25, 0), np.percentile(all_lin, 75, 0)
     ker_med, ker_p25, ker_p75 = np.median(all_ker, 0), np.percentile(all_ker, 25, 0), np.percentile(all_ker, 75, 0)
-    sw_med, sw_p25, sw_p75 = np.median(all_sw, 0), np.percentile(all_sw, 25, 0), np.percentile(all_sw, 75, 0)
 
     sigE_med, sigE_p25, sigE_p75 = np.median(all_sig_err,0), np.percentile(all_sig_err,25,0), np.percentile(all_sig_err,75,0)
     linE_med, linE_p25, linE_p75 = np.median(all_lin_err,0), np.percentile(all_lin_err,25,0), np.percentile(all_lin_err,75,0)
     kerE_med, kerE_p25, kerE_p75 = np.median(all_ker_err,0), np.percentile(all_ker_err,25,0), np.percentile(all_ker_err,75,0)
-    swE_med,  swE_p25,  swE_p75  = np.median(all_sw_err,0),  np.percentile(all_sw_err,25,0),  np.percentile(all_sw_err,75,0)
-    orcE_med, orcE_p25, orcE_p75 = np.median(all_orc_err,0), np.percentile(all_orc_err,25,0), np.percentile(all_orc_err,75,0)
 
+    sigM_med, sigM_p25, sigM_p75 = np.median(all_sig_stat,0), np.percentile(all_sig_stat,25,0), np.percentile(all_sig_stat,75,0)
+    linM_med, linM_p25, linM_p75 = np.median(all_lin_stat,0), np.percentile(all_lin_stat,25,0), np.percentile(all_lin_stat,75,0)
+    kerM_med, kerM_p25, kerM_p75 = np.median(all_ker_stat,0), np.percentile(all_ker_stat,25,0), np.percentile(all_ker_stat,75,0)
+    truM_med, truM_p25, truM_p75 = np.median(all_true_stat,0), np.percentile(all_true_stat,25,0), np.percentile(all_true_stat,75,0)
 
     print(
         f"IntelTemp | reward={reward_mode} | runs={n_runs} | "
-        f"Final med regret — sigUCB: {sig_med[-1]:.3f} | linUCB: {lin_med[-1]:.3f} | kernelUCB: {ker_med[-1]:.3f} | SW-LinUCB: {sw_med[-1]:.3f}"
+        f"Final med regret — sigUCB: {sig_med[-1]:.3f} | linUCB: {lin_med[-1]:.3f} | kernelUCB: {ker_med[-1]:.3f}"
     )
+
+    stat_word = "Max" if reward_mode == "max" else "Avg"
+    stat_word_lower = stat_word.lower()
 
     # regret plot
     x = np.arange(min_len)
     plt.figure(figsize=(8, 4.8))
 
-    plt.plot(x, sig_med, label="sigUCB (median)")
+    plt.plot(x, sig_med, label="sigUCB")
     plt.fill_between(x, sig_p25, sig_p75, alpha=0.20)
 
-    plt.plot(x, lin_med, linestyle="--", label="linUCB (median)")
+    plt.plot(x, lin_med, linestyle="--", label="linUCB")
     plt.fill_between(x, lin_p25, lin_p75, alpha=0.15)
 
-    plt.plot(x, ker_med, linestyle=":", label="kernelUCB (median)")
+    plt.plot(x, ker_med, linestyle=":", label="kernelUCB")
     plt.fill_between(x, ker_p25, ker_p75, alpha=0.12)
-
-    plt.plot(x, sw_med, linestyle="-.", label="SW-LinUCB (median)")
-    plt.fill_between(x, sw_p25, sw_p75, alpha=0.12)
 
     plt.xlabel("Round")
     plt.ylabel("Cumulative Regret")
-    plt.title(f"Intel Lab: Temperature Monitoring ({reward_mode})")
+    plt.title(f"Intel Lab: {stat_word} Temperature Monitoring")
     plt.legend()
     plt.tight_layout()
 
@@ -604,25 +584,18 @@ def main(
     # error plot 
     plt.figure(figsize=(8, 4.8))
 
-    plt.plot(x, sigE_med, label="sigUCB error (median)")
+    plt.plot(x, sigE_med, label="sigUCB")
     plt.fill_between(x, sigE_p25, sigE_p75, alpha=0.20)
 
-    plt.plot(x, linE_med, linestyle="--", label="linUCB error (median)")
+    plt.plot(x, linE_med, linestyle="--", label="linUCB")
     plt.fill_between(x, linE_p25, linE_p75, alpha=0.15)
 
-    plt.plot(x, kerE_med, linestyle=":", label="kernelUCB error (median)")
+    plt.plot(x, kerE_med, linestyle=":", label="kernelUCB")
     plt.fill_between(x, kerE_p25, kerE_p75, alpha=0.12)
 
-    plt.plot(x, swE_med, linestyle="-.", label="SW-LinUCB error (median)")
-    plt.fill_between(x, swE_p25, swE_p75, alpha=0.12)
-
-    # optional: oracle baseline
-    plt.plot(x, orcE_med, linestyle="--", linewidth=2.0, color="k", label="oracle error (median)")
-    plt.fill_between(x, orcE_p25, orcE_p75, color="k", alpha=0.08)
-
     plt.xlabel("Round")
-    plt.ylabel("Temperature Error (|chosen_stat - field_stat|)")
-    plt.title(f"Intel Lab: Temperature Error Over Time ({reward_mode})")
+    plt.ylabel(f"{stat_word} Temperature Absolute Error")
+    plt.title(f"Intel Lab: {stat_word} Temperature Error Over Time")
     plt.legend()
     plt.tight_layout()
 
@@ -630,6 +603,31 @@ def main(
     plt.savefig(os.path.join(out_dir, fname_err), dpi=180)
     plt.close()
 
+    # chosen-sensor max temp vs true field max
+    plt.figure(figsize=(8, 4.8))
+
+    plt.plot(x, truM_med, color="k", linewidth=2.0, label=f"true {stat_word_lower}")
+    plt.fill_between(x, truM_p25, truM_p75, color="k", alpha=0.08)
+
+    plt.plot(x, sigM_med, label="sigUCB")
+    plt.fill_between(x, sigM_p25, sigM_p75, alpha=0.20)
+
+    plt.plot(x, linM_med, linestyle="--", label="linUCB")
+    plt.fill_between(x, linM_p25, linM_p75, alpha=0.15)
+
+    plt.plot(x, kerM_med, linestyle=":", label="kernelUCB")
+    plt.fill_between(x, kerM_p25, kerM_p75, alpha=0.12)
+
+
+    plt.xlabel("Round")
+    plt.ylabel(f"{stat_word} Temperature")
+    plt.title(f"Chosen Sensor {stat_word} vs True {stat_word}")
+    plt.legend()
+    plt.tight_layout()
+
+    fname_max = f"intel_chosen_vs_true_{reward_mode}_{sig_type}_N{sig_depth}_d0{d0}_L{window_L}{tag_str}.png"
+    plt.savefig(os.path.join(out_dir, fname_max), dpi=180)
+    plt.close()
 
 
 if __name__ == "__main__":
@@ -638,9 +636,9 @@ if __name__ == "__main__":
         reward_mode="max",
         sig_type="sig",
         sig_depth=3,
-        d0=3,
+        d0=4,
         window_L=12,
         lam=1.0,
         gamma=1.0,
-        n_runs=100,
+        n_runs=10,
     )

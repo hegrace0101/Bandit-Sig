@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import os
 
 from sigbandit.algos.ucb import sigUCB
-from sigbandit.envs.context import bm, ou, ou_stationary, gbm
+from sigbandit.envs.context import bm, ou_stationary, gbm
 from sigbandit.utils.signature import sig_length
 from tqdm import tqdm
 
@@ -36,7 +36,7 @@ def prune_sig_levels_drop_last_channel(levels: list[np.ndarray], d: int, time_in
 # ------------------------- config -------------------------
 T = 100
 raw_d = 1
-N_total = 100 * 1000
+N_total = T * 1000
 window = N_total // T
 
 depth_list = [1, 2, 3, 4]
@@ -51,13 +51,15 @@ seeds = np.arange(n_runs) + 123
 
 channels_after_time = raw_d + 1  # time + spatial
 
+# bm params
+bm_rho = 0.7
+idx = np.arange(raw_d)
+SIGMA = bm_rho ** np.abs(idx[:, None] - idx[None, :])
+
 def run_diversity_for_depth(sig_depth: int, process: str) -> tuple[np.ndarray, int]:
     # pick process function
     if process == "bm":
         proc_fn = bm
-        log_norm = False
-    elif process == "ou":
-        proc_fn = ou
         log_norm = False
     elif process == "ou_s":
         proc_fn = ou_stationary
@@ -80,18 +82,7 @@ def run_diversity_for_depth(sig_depth: int, process: str) -> tuple[np.ndarray, i
         seed = int(s)
         np.random.seed(seed)
 
-        X = proc_fn(T, N_total)
-
-        # sig_ucb = sigUCB(
-        #     n_actions=1,
-        #     lm=lam,
-        #     gamma=gamma,
-        #     N=sig_depth,
-        #     d=channels_after_time,
-        #     sigType=sig_type,
-        #     log_norm=log_norm,
-        #     fit_intercept=fit_intercept,
-        # )
+        X = proc_fn(T, N_total, Sigma=SIGMA)
 
         Sigma = np.zeros((feat_dim, feat_dim))
 
@@ -142,12 +133,15 @@ def main(process):
 
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
+    linestyles = ["-", "--", "-.", ":"]
+
     for idx, sig_depth in enumerate(depth_list):
         med = lam_min_med[idx]
         p25 = lam_min_p25[idx]
         p75 = lam_min_p75[idx]
 
-        plt.plot(x, med, color=colors[idx], label=f"N={sig_depth}")
+        ls = linestyles[idx % len(linestyles)]
+        plt.plot(x, med, color=colors[idx], linestyle=ls, label=f"N={sig_depth}")
         plt.fill_between(x, p25, p75, color=colors[idx], alpha=0.2)
 
     plt.xlabel("Round t")
@@ -167,8 +161,7 @@ def main(process):
     out_path = os.path.join(out_dir, fname)
     plt.savefig(out_path, dpi=180)
     print(f"Saved figure to {out_path}")
-
-    plt.show()
+    plt.close()
 
     print("Global min λ_min(Σ̂_t):", lam_min_all.min())
     print("Global max λ_min(Σ̂_t):", lam_min_all.max())
