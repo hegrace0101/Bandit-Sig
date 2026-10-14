@@ -5,6 +5,7 @@ Signature-based contextual bandits. The context at each round is a path (window 
 ## What's here
 
 - **`sigUCB`** — linear UCB on truncated path-signature features (with optional time augmentation, time-channel pruning, terminal-state concatenation, and intercept).
+- **`ammSigUCB`** — `sigUCB` with the tuned exploration coefficient `gamma` replaced by the closed-form AMM (Analytic Martingale Mixtures) confidence radius from Flynn, Reeb, Kandemir & Peters, NeurIPS 2023 (arXiv:2309.14298).
 - **`linUCB`** — baseline linear UCB on the raw windowed feature.
 - **`KernelUCB`** — per-arm kernel ridge regression UCB (RBF or polynomial kernel), with incremental block-inverse updates and optional memory cap.
 
@@ -15,7 +16,7 @@ All algorithms expose the same `select(context)` / `update(context, action, rewa
 ```
 src/sigbandit/
   algos/
-    ucb.py            # sigUCB, linUCB
+    ucb.py            # sigUCB, ammSigUCB, linUCB
     kernel_ucb.py     # KernelUCB, SigKernelUCB
   envs/
     bandit.py         # generic Bandit driver
@@ -26,14 +27,17 @@ src/sigbandit/
     hospital_bandit.py     # NYC hospital staffing (newsvendor) environment
   utils/
     signature.py      # signature / log-signature features, time augmentation, time-channel pruning
+    features.py        # non-signature feature transforms (flatten, temporal stats, RFF) for linUCB/KernelUCB baselines
 
 tests/
   test_ucb_sig.py     # synthetic-process sweep: tunes hyperparameters on held-out seeds, evaluates regret across processes/rewards
   test_regret_vs_d.py # regret as a function of path dimension
   test_regret_vs_k.py # regret as a function of number of arms
   check_diversity.py
+  check_diversity_nested_mc.py  # nested Monte Carlo estimate of the action-conditional feature second moment (Assumption 5.1(ii))
   temp_sensor_exp/    # Intel Berkeley lab temperature-sensor experiment
   sleep_edf/          # Sleep-EDF stage-prediction experiment
+    plot_sleep_data.py  # standalone plot of raw EEG/EOG + hypnogram for one cassette record
   hospital_staff/     # NYC hospital staffing experiment
 
 experiments/figs/     # generated plots
