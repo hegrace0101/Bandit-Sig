@@ -6,7 +6,10 @@ Signature-based contextual bandits. The context at each round is a path (window 
 
 - **`sigUCB`** — linear UCB on truncated path-signature features (with optional time augmentation, time-channel pruning, terminal-state concatenation, and intercept).
 - **`ammSigUCB`** — `sigUCB` with the tuned exploration coefficient `gamma` replaced by the closed-form AMM (Analytic Martingale Mixtures) confidence radius from Flynn, Reeb, Kandemir & Peters, NeurIPS 2023 (arXiv:2309.14298).
-- **`linUCB`** — baseline linear UCB on the raw windowed feature.
+- **`linUCB`** — baseline linear UCB; takes a `feat_fn` so it can run on any fixed feature map. The real-data experiments (`temp_sensor_exp`, `sleep_edf`, `hospital_staff`) each sweep three variants over the same window (see `utils/features.py`):
+  - `linUCB_stats` — per-channel temporal stats (mean/std/min/max/first/last/slope).
+  - `linUCB_poly` — degree-2 polynomial features on the time-averaged window.
+  - `linUCB_rff` — random Fourier features approximating an RBF kernel.
 - **`KernelUCB`** — per-arm kernel ridge regression UCB (RBF or polynomial kernel), with incremental block-inverse updates and optional memory cap.
 
 All algorithms expose the same `select(context)` / `update(context, action, reward)` API.
