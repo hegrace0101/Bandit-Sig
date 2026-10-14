@@ -1,0 +1,6 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+tests/sleep_edf/sleep-cassette/
+tests/temp_sensor_exp/temp_sensor.txt

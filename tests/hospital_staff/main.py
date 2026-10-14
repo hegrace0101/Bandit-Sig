@@ -6,11 +6,43 @@ import matplotlib.pyplot as plt
 
 from tqdm import tqdm
 
-from sigbandit.algos.ucb import sigUCB, linUCB
+from sigbandit.algos.ucb import sigUCB, ammSigUCB, linUCB
 from sigbandit.algos.kernel_ucb import KernelUCB
+from sigbandit.utils.features import (
+    temporal_stats_features, temporal_stats_dim,
+    polynomial_features, polynomial_dim,
+    make_rff,
+)
 
 from sigbandit.envs.hospital_bandit import HospitalBandit
 from tests.hospital_staff.load_data import load_nyc_vomit_counts
+
+
+# ------------------------- extra linUCB baselines -------------------------
+# Same UCB math as `linUCB`, different feature transforms of the (L, d) window.
+# All four share (lin_lam, lin_gamma) with the existing linUCB baseline
+# (poly / RFF are on top of the averaged context, so their scale is comparable).
+# RFF uses the tuned RBF bandwidth from KernelUCB.
+LIN_VARIANT_NAMES = ("linUCB_stats", "linUCB_poly", "linUCB_rff")
+
+
+def _build_lin_variants(K, lam, gamma, L, d, rff_sigma, rff_D, seed):
+    return {
+        "linUCB_stats": linUCB(
+            n_actions=K, lm=lam, gamma=gamma,
+            n=temporal_stats_dim(d), feat_fn=temporal_stats_features, seed=seed,
+        ),
+        "linUCB_poly":  linUCB(
+            n_actions=K, lm=lam, gamma=gamma,
+            n=polynomial_dim(d), feat_fn=polynomial_features, seed=seed,
+        ),
+        "linUCB_rff":   linUCB(
+            n_actions=K, lm=lam, gamma=gamma,
+            n=int(rff_D),
+            feat_fn=make_rff(d=int(d), D=int(rff_D), sigma=float(rff_sigma), seed=int(seed)),
+            seed=seed,
+        ),
+    }
 
 
 # ------------------------- helpers: ridge & kernels -------------------------
@@ -205,6 +237,41 @@ def _replay_lin_ucb(X2, Y, K, lam, gamma):
     return cum
 
 
+def _replay_amm_sig_ucb(ctx_wins, Y, K, adds_time, sig_type, N, sigma, delta, B):
+    algo = ammSigUCB(
+        n_actions=K,
+        N=int(N),
+        d=int(ctx_wins[0].shape[1]),
+        sigma=float(sigma),
+        delta=float(delta),
+        B=float(B),
+        sigType=sig_type,
+        log_norm=False,
+        fit_intercept=True,
+        prune_end_time=True,
+        time_augment_bool=adds_time,
+    )
+    cum = 0.0
+    for t in range(len(ctx_wins)):
+        ctx = np.ascontiguousarray(ctx_wins[t], dtype=np.float64)
+        a = algo.select(ctx)
+        r = float(Y[t, a])
+        oracle = float(np.max(Y[t]))
+        algo.update(ctx, a, r)
+        cum += (oracle - r)
+    return cum
+
+
+def _tune_sigma_amm_sig(ctx_wins, Y, K, adds_time, sig_type, N, delta, B, sigma_grid):
+    best = None
+    for s in sigma_grid:
+        reg = _replay_amm_sig_ucb(ctx_wins, Y, K=K, adds_time=adds_time, sig_type=sig_type,
+                                  N=N, sigma=s, delta=delta, B=B)
+        if best is None or reg < best[0]:
+            best = (reg, s)
+    return float(best[1])
+
+
 def _replay_sig_ucb(ctx_wins, Y, K, adds_time, sig_type, N, lam, gamma):
     d_ctx = ctx_wins[0].shape[1]
     sig = sigUCB(
@@ -350,10 +417,17 @@ def run_one_hospital(
         lin_gamma = _tune_gamma_lin(X2, Y, K=K, lam=lin_lam, gamma_grid=gamma_grid)
         sig_gamma = _tune_gamma_sig(ctx_wins, Y, K=K, adds_time=adds_time, sig_type=sig_type, N=sig_N, lam=sig_lam, gamma_grid=gamma_grid)
         ker_gamma = _tune_gamma_kernel(X2, Y, K=K, sigma=ker_sigma, lam=ker_lam, gamma_grid=gamma_grid, seed=seed)
+
+        amm_sigma_grid = [0.01, 0.1, 0.3, 1.0, 3.0, 10.0, 100.0]
+        amm_sigma = _tune_sigma_amm_sig(
+            ctx_wins, Y, K=K, adds_time=adds_time, sig_type=sig_type,
+            N=sig_N, delta=0.05, B=1.0, sigma_grid=amm_sigma_grid,
+        )
     else:
         lin_lam, lin_gamma = lam, gamma
         sig_N, sig_lam, sig_gamma = sig_depth, lam, gamma
         ker_sigma, ker_lam, ker_gamma = 0.5, lam, gamma
+        amm_sigma = 1.0
 
     # print(
     # f"[seed={seed}] chosen params | "
@@ -380,6 +454,24 @@ def run_one_hospital(
         time_augment_bool=adds_time
     )
 
+    # AMM-sigUCB: same signature features + depth as sigUCB, but the confidence
+    # radius comes from the AMM analytic bound (no gamma to tune). sigma is a
+    # regularization / noise scale; delta is the confidence level; B bounds ||theta*||.
+    # amm_ucb = ammSigUCB(
+    #     n_actions=K,
+    #     N=int(sig_N),
+    #     d=int(ctx_wins[0].shape[1]),
+    #     sigma=float(amm_sigma),
+    #     delta=0.05,
+    #     B=1.0,
+    #     sigType=sig_type,
+    #     log_norm=False,
+    #     fit_intercept=True,
+    #     seed=seed,
+    #     prune_end_time=True,
+    #     time_augment_bool=adds_time,
+    # )
+
     lin_ucb = linUCB(
         n_actions=K,
         lm=float(lin_lam),
@@ -400,13 +492,27 @@ def run_one_hospital(
         seed=seed,
     )
 
+    # extra linUCB baselines on different feature transforms of the raw window
+    L_ctx = int(ctx_wins[0].shape[0]) if len(ctx_wins) > 0 else int(env.observe_context_window().shape[0])
+    d_ctx_full = int(ctx_wins[0].shape[1]) if len(ctx_wins) > 0 else int(env.observe_context_window().shape[1])
+    lin_variants = _build_lin_variants(
+        K=K, lam=lin_lam, gamma=lin_gamma,
+        L=L_ctx, d=d_ctx_full, rff_sigma=ker_sigma, rff_D=64, seed=seed,
+    )
+
     # ---------- bandit phase ----------
     sig_reg, lin_reg, ker_reg = [], [], []
+    # amm_reg = []
+    variant_reg = {name: [] for name in lin_variants}
 
     sig_actions, lin_actions, ker_actions = [], [], []
+    # amm_actions = []
+    variant_actions = {name: [] for name in lin_variants}
     weekly_counts = []
 
     sig_cum = lin_cum = ker_cum = 0.0
+    # amm_cum = 0.0
+    variant_cum = {name: 0.0 for name in lin_variants}
 
     # After warmup, env.t is already at week = warmup_weeks (or as far as data allowed)
     while env.next_round():
@@ -418,12 +524,14 @@ def run_one_hospital(
         a_sig = sig_ucb.select(ctx_win)
         a_lin = lin_ucb.select(ctx_lin)
         a_ker = ker_ucb.select(x)
+        # a_amm = amm_ucb.select(ctx_win)
 
         # record realized next-week demand and chosen staffing levels
         weekly_counts.append(float(env.weekly_counts[env.t + 1]))
         sig_actions.append(float(env.actions[a_sig]))
         lin_actions.append(float(env.actions[a_lin]))
         ker_actions.append(float(env.actions[a_ker]))
+        # amm_actions.append(float(env.actions[a_amm]))
 
         # evaluate immediately using env.reward(), which uses D_{t+1}
         oracle_r, _ = env.oracle()
@@ -443,11 +551,27 @@ def run_one_hospital(
         ker_cum += (oracle_r - r_ker)
         ker_reg.append(ker_cum)
 
+        # r_amm = env.reward(a_amm)
+        # amm_ucb.update(ctx_win, a_amm, r_amm)
+        # amm_cum += (oracle_r - r_amm)
+        # amm_reg.append(amm_cum)
+
+        for name, algo in lin_variants.items():
+            a_v = algo.select(ctx_win)
+            r_v = env.reward(a_v)
+            algo.update(ctx_win, a_v, r_v)
+            variant_cum[name] += (oracle_r - r_v)
+            variant_reg[name].append(variant_cum[name])
+            variant_actions[name].append(float(env.actions[a_v]))
+
         env.step_time()
 
     return (
         np.array(sig_reg), np.array(lin_reg), np.array(ker_reg),
-        np.array(weekly_counts), np.array(sig_actions), np.array(lin_actions), np.array(ker_actions)
+        np.array(weekly_counts), np.array(sig_actions), np.array(lin_actions), np.array(ker_actions),
+        {name: np.array(reg) for name, reg in variant_reg.items()},
+        # np.array(amm_reg),
+        {name: np.array(acts) for name, acts in variant_actions.items()},
     )
 
 
@@ -490,6 +614,9 @@ def main(
     sig_action_list   = [r[4] for r in runs]
     lin_action_list   = [r[5] for r in runs]
     ker_action_list   = [r[6] for r in runs]
+    variant_lists = {name: [r[7][name] for r in runs] for name in LIN_VARIANT_NAMES}
+    # amm_list = [r[8] for r in runs]
+    variant_action_lists = {name: [r[8][name] for r in runs] for name in LIN_VARIANT_NAMES}
 
 
     min_len = min(
@@ -500,11 +627,15 @@ def main(
         min(len(r) for r in sig_action_list),
         min(len(r) for r in lin_action_list),
         min(len(r) for r in ker_action_list),
+        min(min(len(r) for r in arrs) for arrs in variant_lists.values()),
+        # min(len(r) for r in amm_list),
     )
 
     all_sig = np.stack([r[:min_len] for r in sig_list], axis=0)
     all_lin = np.stack([r[:min_len] for r in lin_list], axis=0)
     all_ker = np.stack([r[:min_len] for r in ker_list], axis=0)
+    # all_amm = np.stack([r[:min_len] for r in amm_list], axis=0)
+    variant_stacked = {name: np.stack([r[:min_len] for r in arrs], 0) for name, arrs in variant_lists.items()}
 
     all_weekly = np.stack([r[:min_len] for r in weekly_count_list], axis=0)
     all_sig_a  = np.stack([r[:min_len] for r in sig_action_list], axis=0)
@@ -514,16 +645,32 @@ def main(
     sig_med, sig_p25, sig_p75 = np.median(all_sig, 0), np.percentile(all_sig, 25, 0), np.percentile(all_sig, 75, 0)
     lin_med, lin_p25, lin_p75 = np.median(all_lin, 0), np.percentile(all_lin, 25, 0), np.percentile(all_lin, 75, 0)
     ker_med, ker_p25, ker_p75 = np.median(all_ker, 0), np.percentile(all_ker, 25, 0), np.percentile(all_ker, 75, 0)
+    # amm_med, amm_p25, amm_p75 = np.median(all_amm, 0), np.percentile(all_amm, 25, 0), np.percentile(all_amm, 75, 0)
+    variant_med = {name: np.median(v, 0) for name, v in variant_stacked.items()}
+    variant_p25 = {name: np.percentile(v, 25, 0) for name, v in variant_stacked.items()}
+    variant_p75 = {name: np.percentile(v, 75, 0) for name, v in variant_stacked.items()}
 
     weekly_med = np.median(all_weekly, axis=0)
     sig_a_med, sig_a_p25, sig_a_p75 = np.median(all_sig_a, 0), np.percentile(all_sig_a, 25, 0), np.percentile(all_sig_a, 75, 0)
     lin_a_med, lin_a_p25, lin_a_p75 = np.median(all_lin_a, 0), np.percentile(all_lin_a, 25, 0), np.percentile(all_lin_a, 75, 0)
     ker_a_med, ker_a_p25, ker_a_p75 = np.median(all_ker_a, 0), np.percentile(all_ker_a, 25, 0), np.percentile(all_ker_a, 75, 0)
+    variant_a_stacked = {name: np.stack([r[:min_len] for r in arrs], 0) for name, arrs in variant_action_lists.items()}
+    variant_a_med = {name: np.median(v, 0) for name, v in variant_a_stacked.items()}
+    variant_a_p25 = {name: np.percentile(v, 25, 0) for name, v in variant_a_stacked.items()}
+    variant_a_p75 = {name: np.percentile(v, 75, 0) for name, v in variant_a_stacked.items()}
     
-    print(
-        f"Hospital | warmup={warmup_weeks}w | runs={n_runs} | "
-        f"Final med regret — sigUCB: {sig_med[-1]:.3f} | linUCB: {lin_med[-1]:.3f} | kernelUCB: {ker_med[-1]:.3f}"
-    )
+    method_stats = [
+        ("sigUCB",     sig_med[-1], sig_p25[-1], sig_p75[-1]),
+        # ("ammSigUCB",  amm_med[-1], amm_p25[-1], amm_p75[-1]),
+        ("linUCB",     lin_med[-1], lin_p25[-1], lin_p75[-1]),
+        ("kernelUCB",  ker_med[-1], ker_p25[-1], ker_p75[-1]),
+    ] + [
+        (name, variant_med[name][-1], variant_p25[name][-1], variant_p75[name][-1])
+        for name in LIN_VARIANT_NAMES
+    ]
+    print(f"\n=== Hospital | warmup={warmup_weeks}w | runs={n_runs} — final cumulative regret ===")
+    for name, med, p25, p75 in method_stats:
+        print(f"  {name:14s} | median={med:12.3f} | p25={p25:12.3f} | p75={p75:12.3f}")
 
     # regret plot
     x = np.arange(min_len)
@@ -532,11 +679,18 @@ def main(
     plt.plot(x, sig_med, label="sigUCB (median)")
     plt.fill_between(x, sig_p25, sig_p75, alpha=0.20)
 
+    # plt.plot(x, amm_med, linestyle="-", label="AMM-sigUCB (median)")
+    # plt.fill_between(x, amm_p25, amm_p75, alpha=0.18)
+
     plt.plot(x, lin_med, linestyle="--", label="linUCB (median)")
     plt.fill_between(x, lin_p25, lin_p75, alpha=0.15)
 
     plt.plot(x, ker_med, linestyle="-.", label="kernelUCB (median)")
     plt.fill_between(x, ker_p25, ker_p75, alpha=0.12)
+
+    for name in LIN_VARIANT_NAMES:
+        plt.plot(x, variant_med[name], linestyle=":", label=f"{name} (median)")
+        plt.fill_between(x, variant_p25[name], variant_p75[name], alpha=0.10)
 
     plt.xlim(left=100, right=min_len-1)
     plt.ylim(bottom=10000)
@@ -592,6 +746,13 @@ def main(
     ax2.fill_between(x, lin_p25_plot, lin_p75_plot, step="mid", alpha=0.12)
     ax2.plot(x, ker_med_plot, linestyle="-.", linewidth=2.0, label="kernelUCB (median)")
     ax2.fill_between(x, ker_p25_plot, ker_p75_plot, step="mid", alpha=0.12)
+
+    for name in LIN_VARIANT_NAMES:
+        v_med_plot = moving_avg(variant_a_med[name], w=5)
+        v_p25_plot = moving_avg(variant_a_p25[name], w=5)
+        v_p75_plot = moving_avg(variant_a_p75[name], w=5)
+        ax2.plot(x, v_med_plot, linestyle=":", linewidth=2.0, label=f"{name} (median)")
+        ax2.fill_between(x, v_p25_plot, v_p75_plot, step="mid", alpha=0.08)
 
     ax2.set_ylabel("Assigned Nurse Staffing")
 

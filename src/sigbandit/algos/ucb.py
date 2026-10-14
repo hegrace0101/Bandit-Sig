@@ -134,15 +134,107 @@ class sigUCB:
         self._theta[a] = Vinv @ b
 
 
+class ammSigUCB(sigUCB):
+    """
+    Distributional SigUCB with the AMM (Analytic Martingale Mixtures) confidence
+    radius from Flynn, Reeb, Kandemir & Peters, NeurIPS 2023 (arXiv:2309.14298),
+    "Improved Algorithms for Stochastic Linear Bandits Using Tail Bounds for
+    Martingale Mixtures".
+
+    Same signature feature map as sigUCB, same per-arm ridge regression, but the
+    tuned exploration coefficient `gamma` is replaced by the closed-form radius
+    R_AMM derived from martingale-mixture tail bounds with the standard mixture
+    (theta_0 = 0, Sigma_0 = I) and alpha = sigma^2:
+
+        R_AMM^2 = sigma^2 * (logdet(V) - d * log(sigma^2))
+                + 2 * sigma^2 * log(1/delta)
+                + sigma^2 * B^2,
+
+    where V = sigma^2 * I + Phi^T Phi is the per-arm regularised design matrix.
+    """
+    def __init__(
+        self,
+        n_actions,
+        N,
+        d,
+        sigma=0.1,
+        delta=0.05,
+        B=1.0,
+        sigType='sig',
+        log_norm=False,
+        fit_intercept=False,
+        seed=0,
+        prune_end_time=True,
+        time_index=0,
+        time_augment_bool=True,
+    ):
+        self.sigma = float(sigma)
+        self.delta = float(delta)
+        self.B = float(B)
+        super().__init__(
+            n_actions=n_actions,
+            lm=self.sigma ** 2,
+            gamma=0.0,
+            N=N,
+            d=d,
+            sigType=sigType,
+            log_norm=log_norm,
+            fit_intercept=fit_intercept,
+            seed=seed,
+            prune_end_time=prune_end_time,
+            time_index=time_index,
+            time_augment_bool=time_augment_bool,
+        )
+        self._logdetV = [self._dim * np.log(self.sigma ** 2) for _ in range(self.K)]
+
+    def _radius(self, a):
+        s2 = self.sigma ** 2
+        r2 = (
+            s2 * (self._logdetV[a] - self._dim * np.log(s2))
+            + 2.0 * s2 * np.log(1.0 / self.delta)
+            + s2 * (self.B ** 2)
+        )
+        return float(np.sqrt(max(0.0, r2)))
+
+    def select(self, context):
+        feat = self.sig_feat(context)
+        ucbs = np.zeros(self.K, dtype=float)
+        for a in range(self.K):
+            mu = float(feat @ self._theta[a])
+            sd2 = max(0.0, float(feat @ (self._Vinv[a] @ feat)))
+            ucbs[a] = mu + self._radius(a) * np.sqrt(sd2)
+        m = ucbs.max()
+        ties = np.flatnonzero(np.isclose(ucbs, m))
+        return int(self.rng.choice(ties))
+
+    def update(self, context, action, reward):
+        feat = self.sig_feat(context)
+        a = int(action)
+        V    = self._V[a]
+        b    = self._b[a]
+        Vinv = self._Vinv[a]
+
+        Au = Vinv @ feat
+        denom = 1.0 + float(feat @ Au)
+        if denom > 0.0:
+            self._logdetV[a] += float(np.log(denom))
+
+        V += np.outer(feat, feat)
+        b += reward * feat
+        Vinv -= np.outer(Au, Au) / denom
+        self._theta[a] = Vinv @ b
+
+
 class linUCB:
-    def __init__(self, n_actions, lm, gamma, n, log_norm=False, fit_intercept=False, seed=0):
+    def __init__(self, n_actions, lm, gamma, n, feat_fn=None, log_norm=False, fit_intercept=False, seed=0):
         self.K = int(n_actions)				        # number of arms (0,...,K-1)
         self.lm = float(lm)							# ridge regression penalty
-        self.gamma = gamma							# exploration parameter	
-        self.n = n									# number of points in window
-        self.log_norm = log_norm                    # for gbm
+        self.gamma = gamma							# exploration parameter
+        self.n = n									# feature dimension
+        self.feat_fn = feat_fn                      # optional callable: context -> (n,) feature
+        self.log_norm = log_norm                    # for gbm (only used when feat_fn is None)
         self.fit_intercept = bool(fit_intercept)	# fit intercept, do later?
-        
+
         # per-arm state
         self._V     = [self.lm * np.eye(self.n)  for _ in range(self.K)]
         self._Vinv  = [np.eye(self.n) / self.lm  for _ in range(self.K)]
@@ -150,10 +242,18 @@ class linUCB:
         self._theta = [np.zeros(self.n)          for _ in range(self.K)]
 
         self.rng = np.random.default_rng(seed)
-    
-    def lin_feat(self, context):
-        context = np.asarray(context, dtype=float)
 
+    def lin_feat(self, context):
+        if self.feat_fn is not None:
+            feat = np.asarray(self.feat_fn(context), dtype=float).ravel()
+            if feat.shape[0] != self.n:
+                raise ValueError(
+                    f"feat_fn returned dim {feat.shape[0]}, expected n={self.n}"
+                )
+            return feat
+
+        # legacy default: 1D passthrough, else first channel of (L, d)
+        context = np.asarray(context, dtype=float)
         if context.ndim == 1:
             feat = context
         else:

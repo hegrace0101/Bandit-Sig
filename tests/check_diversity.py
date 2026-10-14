@@ -56,7 +56,13 @@ bm_rho = 0.7
 idx = np.arange(raw_d)
 SIGMA = bm_rho ** np.abs(idx[:, None] - idx[None, :])
 
-def run_diversity_for_depth(sig_depth: int, process: str) -> tuple[np.ndarray, int]:
+def run_diversity_for_depth(
+    sig_depth: int,
+    process: str,
+    gbm_mu: float = 0.1,
+    gbm_sigma_scale: float = 1.0,
+    gbm_x0_scale: float = 0.0,   # if > 0, x0 ~ Uniform[1, 1 + gbm_x0_scale] per seed
+) -> tuple[np.ndarray, int]:
     # pick process function
     if process == "bm":
         proc_fn = bm
@@ -74,7 +80,8 @@ def run_diversity_for_depth(sig_depth: int, process: str) -> tuple[np.ndarray, i
     sig_dim_pruned = sum((d ** (k - 1)) * (d - 1) for k in range(1, sig_depth + 1))
     feat_dim = sig_dim_pruned + raw_d
 
-    print(f"[depth N={sig_depth}] | pruned sig dim: {sig_dim_pruned} | feat_dim: {feat_dim}")
+    print(f"[depth N={sig_depth}] | pruned sig dim: {sig_dim_pruned} | feat_dim: {feat_dim} | "
+          f"gbm(mu={gbm_mu}, sigma_scale={gbm_sigma_scale}, x0_scale={gbm_x0_scale})")
 
     lm_min_depth = np.zeros((n_runs, T))
 
@@ -82,12 +89,31 @@ def run_diversity_for_depth(sig_depth: int, process: str) -> tuple[np.ndarray, i
         seed = int(s)
         np.random.seed(seed)
 
-        X = proc_fn(T, N_total, Sigma=SIGMA)
+        if process == "gbm":
+            Sigma_local = (gbm_sigma_scale ** 2) * SIGMA  # variance scales by sigma^2
+            if gbm_x0_scale > 0:
+                x0_val = 1.0 + gbm_x0_scale * np.random.rand()
+            else:
+                x0_val = 1.0
+            X = proc_fn(T, N_total, x0=x0_val, mu=gbm_mu, Sigma=Sigma_local)
+        else:
+            X = proc_fn(T, N_total, Sigma=SIGMA)
 
         Sigma = np.zeros((feat_dim, feat_dim))
 
         for t in range(T):
             ctx = X[t * window : (t + 1) * window, :]   # (window, raw_d)
+
+            # Preserve RAW initial and terminal values before any log-norm
+            # (sigUCB concatenates the raw terminal xT with the signature).
+            x0_raw = ctx[0].ravel()
+            xT_raw = ctx[-1].ravel()
+
+            # Match sigUCB's log_norm=True: for GBM the algorithm computes
+            # signatures on log(context / context[0]), which is Brownian-motion-like
+            # and much better conditioned than signatures of the raw exponential path.
+            if log_norm:
+                ctx = np.log(ctx / ctx[0])
 
             # build time-augmented path
             tau = np.linspace(0, 1, num=ctx.shape[0], dtype=float)
@@ -98,10 +124,11 @@ def run_diversity_for_depth(sig_depth: int, process: str) -> tuple[np.ndarray, i
             levels = sig_list_levels(t_X, sig_depth)     # list of level arrays
             sig_pruned = prune_sig_levels_drop_last_channel(levels, d=d, time_index=0)
 
-            # x0 is the original (non-time) initial condition
-            x0 = ctx[0].ravel()
+            # Extra state feature. sigUCB uses xT (raw terminal); use x0 for
+            # non-log-normed processes to preserve prior behavior.
+            extra = xT_raw if log_norm else x0_raw
 
-            feat = np.concatenate([sig_pruned, x0])
+            feat = np.concatenate([sig_pruned, extra])
             assert feat.shape[0] == feat_dim, (feat.shape[0], feat_dim)
 
             Sigma += np.outer(feat, feat)
@@ -113,12 +140,15 @@ def run_diversity_for_depth(sig_depth: int, process: str) -> tuple[np.ndarray, i
     return lm_min_depth, feat_dim
 
 
-def main(process):
+def main(process, gbm_mu=0.1, gbm_sigma_scale=1.0, gbm_x0_scale=0.0, tag=None):
     lm_min_all_depths = []
     feat_dims = []
 
     for sig_depth in depth_list:
-        lm_min_depth, feat_dim = run_diversity_for_depth(sig_depth, process)
+        lm_min_depth, feat_dim = run_diversity_for_depth(
+            sig_depth, process,
+            gbm_mu=gbm_mu, gbm_sigma_scale=gbm_sigma_scale, gbm_x0_scale=gbm_x0_scale,
+        )
         lm_min_all_depths.append(lm_min_depth)
         feat_dims.append(feat_dim)
 
@@ -157,7 +187,8 @@ def main(process):
 
     out_dir = "experiments/figs/diversity_assumption"
     os.makedirs(out_dir, exist_ok=True)
-    fname = f"sig_diversity_pruned_end_time_{process}.png"
+    tag_str = f"_{tag}" if tag else ""
+    fname = f"sig_diversity_pruned_end_time_{process}{tag_str}.png"
     out_path = os.path.join(out_dir, fname)
     plt.savefig(out_path, dpi=180)
     print(f"Saved figure to {out_path}")

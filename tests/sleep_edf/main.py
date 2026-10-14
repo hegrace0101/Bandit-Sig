@@ -4,11 +4,34 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from sigbandit.algos.ucb import sigUCB, linUCB
+from sigbandit.algos.ucb import sigUCB, ammSigUCB, linUCB
 from sigbandit.algos.kernel_ucb import KernelUCB
+from sigbandit.utils.features import (
+    temporal_stats_features, temporal_stats_dim,
+    polynomial_features, polynomial_dim,
+    make_rff,
+)
 
 from sigbandit.envs.sleep_bandit import SleepBandit
 from tests.sleep_edf.load_data import load_sleep_cassette
+
+
+# extra linUCB baselines: same UCB math, different feature transforms of the (L, d) EEG window.
+# All four reuse the tuned (lin_lam, lin_gamma); RFF reuses the tuned KernelUCB RBF bandwidth.
+LIN_VARIANT_NAMES = ("linUCB_stats", "linUCB_poly", "linUCB_rff")
+
+
+def _build_lin_variants(K, lam, gamma, L, d, rff_sigma, rff_D, seed):
+    return {
+        "linUCB_stats": linUCB(n_actions=K, lm=lam, gamma=gamma,
+                               n=temporal_stats_dim(d), feat_fn=temporal_stats_features, seed=seed),
+        "linUCB_poly":  linUCB(n_actions=K, lm=lam, gamma=gamma,
+                               n=polynomial_dim(d), feat_fn=polynomial_features, seed=seed),
+        "linUCB_rff":   linUCB(n_actions=K, lm=lam, gamma=gamma,
+                               n=int(rff_D),
+                               feat_fn=make_rff(d=int(d), D=int(rff_D), sigma=float(rff_sigma), seed=int(seed)),
+                               seed=seed),
+    }
 
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report
 import json
@@ -229,6 +252,33 @@ def _replay_kernel_ucb(X, Y, K, sigma, lam, gamma, seed=0):
         cum += (oracle - r)
     return cum
 
+def _replay_amm_sig_ucb(ctx_wins, Y, K, sig_type, N, sigma, delta, B, seed=0):
+    d_ctx = ctx_wins[0].shape[1]
+    alg = ammSigUCB(
+        n_actions=K,
+        N=int(N),
+        d=int(d_ctx),
+        sigma=float(sigma),
+        delta=float(delta),
+        B=float(B),
+        sigType=sig_type,
+        log_norm=False,
+        fit_intercept=True,
+        seed=int(seed),
+        prune_end_time=True,
+        time_augment_bool=True,
+    )
+    cum = 0.0
+    for t in range(len(ctx_wins)):
+        ctx = np.ascontiguousarray(ctx_wins[t], np.float64)
+        a = alg.select(ctx)
+        r = float(Y[t, a])
+        oracle = float(np.max(Y[t]))
+        alg.update(ctx, a, r)
+        cum += (oracle - r)
+    return cum
+
+
 def _tune_gamma(fn, gamma_grid):
     best = None
     for g in gamma_grid:
@@ -295,9 +345,10 @@ def run_one_sleep_record(
         sig_N, sig_lam = sig_depth, 1.0
         ker_sigma, ker_lam = 1.0, 1.0
         lin_gamma = sig_gamma = ker_gamma = 1.0
+        amm_sigma = 1.0
     else:
         lam_grid   = [1e-6, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0]
-        N_grid     = [1,2,3,4]
+        N_grid     = [1, 2]
         sigma_grid = [0.1, 0.2, 0.5, 1.0, 2.0]
 
         # stage-1 selection (supervised)
@@ -319,6 +370,12 @@ def run_one_sleep_record(
         lin_gamma = _tune_gamma(lambda g: _replay_lin_ucb(Xfeat, Y, K, lin_lam, g, seed=seed), gamma_grid)
         sig_gamma = _tune_gamma(lambda g: _replay_sig_ucb(ctx_wins, Y, K, sig_type, sig_N, sig_lam, g, seed=seed), gamma_grid)
         ker_gamma = _tune_gamma(lambda g: _replay_kernel_ucb(Xfeat, Y, K, ker_sigma, ker_lam, g, seed=seed), gamma_grid)
+
+        amm_sigma_grid = [0.01, 0.1, 0.3, 1.0, 3.0, 10.0]
+        amm_sigma = _tune_gamma(
+            lambda s: _replay_amm_sig_ucb(ctx_wins, Y, K, sig_type, sig_N, s, 0.05, 1.0, seed=seed),
+            amm_sigma_grid,
+        )
         
     # print(
     #     f"[seed={seed}] chosen signature depth N={sig_N} | "
@@ -361,12 +418,43 @@ def run_one_sleep_record(
         seed=seed,
     )
 
+    # AMM-sigUCB: same signature features + depth as sigUCB, but the confidence
+    # radius comes from the AMM analytic bound (no gamma to tune). sigma is a
+    # regularization / noise scale; delta is the confidence level; B bounds ||theta*||.
+    # amm_alg = ammSigUCB(
+    #     n_actions=K,
+    #     N=int(sig_N),
+    #     d=int(d_ctx),
+    #     sigma=float(amm_sigma),
+    #     delta=0.05,
+    #     B=1.0,
+    #     sigType=sig_type,
+    #     log_norm=False,
+    #     fit_intercept=True,
+    #     seed=seed,
+    #     prune_end_time=True,
+    #     time_augment_bool=True,
+    # )
+
+    L_ctx = int(ctx_wins[0].shape[0]) if len(ctx_wins) > 0 else int(env.observe_context_window().shape[0])
+    lin_variants = _build_lin_variants(
+        K=K, lam=lin_lam, gamma=lin_gamma,
+        L=L_ctx, d=d_ctx, rff_sigma=ker_sigma, rff_D=64, seed=seed,
+    )
+
     # ---------- online bandit phase ----------
     sig_reg, lin_reg, ker_reg = [], [], []
+    # amm_reg = []
     sig_cum = lin_cum = ker_cum = 0.0
+    # amm_cum = 0.0
+
+    variant_reg = {name: [] for name in lin_variants}
+    variant_cum = {name: 0.0 for name in lin_variants}
+    y_variant = {name: [] for name in lin_variants}
 
     y_true = []
     y_sig, y_lin, y_ker = [], [], []
+    # y_amm = []
 
     while env.next_round():
         ctx = np.ascontiguousarray(env.observe_context_window(), dtype=np.float64)
@@ -376,6 +464,7 @@ def run_one_sleep_record(
         a_sig = sig_alg.select(ctx)
         a_lin = lin_alg.select(ctx_lin)
         a_ker = ker_alg.select(x)
+        # a_amm = amm_alg.select(ctx)
 
         oracle_r, _ = env.oracle()
 
@@ -387,18 +476,30 @@ def run_one_sleep_record(
         y_sig.append(int(a_sig))
         y_lin.append(int(a_lin))
         y_ker.append(int(a_ker))
+        # y_amm.append(int(a_amm))
 
         r_sig = env.reward(a_sig); sig_alg.update(ctx, a_sig, float(r_sig))
         r_lin = env.reward(a_lin); lin_alg.update(ctx_lin, a_lin, float(r_lin))
         r_ker = env.reward(a_ker); ker_alg.update(x, a_ker, float(r_ker))
+        # r_amm = env.reward(a_amm); amm_alg.update(ctx, a_amm, float(r_amm))
 
         sig_cum += float(oracle_r - r_sig)
         lin_cum += float(oracle_r - r_lin)
         ker_cum += float(oracle_r - r_ker)
+        # amm_cum += float(oracle_r - r_amm)
 
         sig_reg.append(sig_cum)
         lin_reg.append(lin_cum)
         ker_reg.append(ker_cum)
+        # amm_reg.append(amm_cum)
+
+        for name, algo in lin_variants.items():
+            a_v = algo.select(ctx)
+            r_v = env.reward(a_v)
+            algo.update(ctx, a_v, float(r_v))
+            variant_cum[name] += float(oracle_r - r_v)
+            variant_reg[name].append(variant_cum[name])
+            y_variant[name].append(int(a_v))
 
         env.step_time()
 
@@ -421,6 +522,8 @@ def run_one_sleep_record(
         "kernelUCB": _metrics(y_ker),
         "n_eval": int(n_eval),
     }
+    for name in y_variant:
+        clf_metrics[name] = _metrics(y_variant[name])
 
     rolling_window = n_eval
 
@@ -433,12 +536,17 @@ def run_one_sleep_record(
         "linUCB_weighted_f1": _rolling_metric(y_true, y_lin, window=rolling_window, metric="weighted_f1"),
         "kernelUCB_weighted_f1": _rolling_metric(y_true, y_ker, window=rolling_window, metric="weighted_f1"),
     }
+    for name in y_variant:
+        metric_traj[f"{name}_acc"] = _rolling_metric(y_true, y_variant[name], window=rolling_window, metric="accuracy")
+        metric_traj[f"{name}_weighted_f1"] = _rolling_metric(y_true, y_variant[name], window=rolling_window, metric="weighted_f1")
 
 
     return (
         np.array(sig_reg), np.array(lin_reg), np.array(ker_reg),
         clf_metrics,
         metric_traj,
+        {name: np.array(reg) for name, reg in variant_reg.items()},
+        # np.array(amm_reg),
     )
 
 
@@ -499,12 +607,22 @@ def main(
     ker_list = [r[2] for r in runs]
     metric_list = [r[3] for r in runs]
     traj_list = [r[4] for r in runs]
+    variant_lists = {name: [r[5][name] for r in runs] for name in LIN_VARIANT_NAMES}
+    # amm_list = [r[6] for r in runs]
 
     min_len = T_CUT
 
     all_sig = np.stack([x[:min_len] for x in sig_list], axis=0)
     all_lin = np.stack([x[:min_len] for x in lin_list], axis=0)
     all_ker = np.stack([x[:min_len] for x in ker_list], axis=0)
+    # all_amm = np.stack([x[:min_len] for x in amm_list], axis=0)
+    variant_stacked = {name: np.stack([x[:min_len] for x in arrs], 0) for name, arrs in variant_lists.items()}
+    variant_med = {name: np.median(v, 0) for name, v in variant_stacked.items()}
+    variant_p25 = {name: np.percentile(v, 25, 0) for name, v in variant_stacked.items()}
+    variant_p75 = {name: np.percentile(v, 75, 0) for name, v in variant_stacked.items()}
+    # amm_med = np.median(all_amm, 0)
+    # amm_p25 = np.percentile(all_amm, 25, 0)
+    # amm_p75 = np.percentile(all_amm, 75, 0)
 
     def _qstats(A):
         return np.median(A, 0), np.percentile(A, 25, 0), np.percentile(A, 75, 0)
@@ -525,6 +643,15 @@ def main(
     all_sig_wf1 = np.stack([m["sigUCB_weighted_f1"][:min_len] for m in traj_list], axis=0)
     all_lin_wf1 = np.stack([m["linUCB_weighted_f1"][:min_len] for m in traj_list], axis=0)
     all_ker_wf1 = np.stack([m["kernelUCB_weighted_f1"][:min_len] for m in traj_list], axis=0)
+    variant_wf1_stacked = {
+        name: np.stack([m[f"{name}_weighted_f1"][:min_len] for m in traj_list], axis=0)
+        for name in LIN_VARIANT_NAMES
+    }
+    variant_wf1_mean = {name: np.mean(v, 0) for name, v in variant_wf1_stacked.items()}
+    variant_wf1_sd = {name: np.std(v, 0, ddof=1) for name, v in variant_wf1_stacked.items()}
+    variant_wf1_med = {name: np.median(v, 0) for name, v in variant_wf1_stacked.items()}
+    variant_wf1_p25 = {name: np.percentile(v, 25, 0) for name, v in variant_wf1_stacked.items()}
+    variant_wf1_p75 = {name: np.percentile(v, 75, 0) for name, v in variant_wf1_stacked.items()}
 
     sig_acc_mean, sig_acc_sd = _meanstd(all_sig_acc)
     lin_acc_mean, lin_acc_sd = _meanstd(all_lin_acc)
@@ -542,10 +669,18 @@ def main(
     lin_wf1_med, lin_wf1_p25, lin_wf1_p75 = _qstats(all_lin_wf1)
     ker_wf1_med, ker_wf1_p25, ker_wf1_p75 = _qstats(all_ker_wf1)
 
-    print(
-        f"Sleep-EDF | runs={n_runs} | Final med regret — "
-        f"sigUCB: {sig_med[-1]:.3f} | linUCB: {lin_med[-1]:.3f} | kernelUCB: {ker_med[-1]:.3f}"
-    )
+    method_stats = [
+        ("sigUCB",     sig_med[-1], sig_p25[-1], sig_p75[-1]),
+        # ("ammSigUCB",  amm_med[-1], amm_p25[-1], amm_p75[-1]),
+        ("linUCB",     lin_med[-1], lin_p25[-1], lin_p75[-1]),
+        ("kernelUCB",  ker_med[-1], ker_p25[-1], ker_p75[-1]),
+    ] + [
+        (name, variant_med[name][-1], variant_p25[name][-1], variant_p75[name][-1])
+        for name in LIN_VARIANT_NAMES
+    ]
+    print(f"\n=== Sleep-EDF | runs={n_runs} — final cumulative regret ===")
+    for name, med, p25, p75 in method_stats:
+        print(f"  {name:14s} | median={med:10.3f} | p25={p25:10.3f} | p75={p75:10.3f}")
 
     os.makedirs(out_dir, exist_ok=True)
     tag_str = f"_{tag}" if tag else ""
@@ -555,10 +690,15 @@ def main(
     plt.figure(figsize=(8, 4.8))
     plt.plot(x, sig_med, label="sigUCB (median)")
     plt.fill_between(x, sig_p25, sig_p75, alpha=0.20)
+    # plt.plot(x, amm_med, linestyle="-", label="AMM-sigUCB (median)")
+    # plt.fill_between(x, amm_p25, amm_p75, alpha=0.18)
     plt.plot(x, lin_med, linestyle="--", label="linUCB (median)")
     plt.fill_between(x, lin_p25, lin_p75, alpha=0.15)
     plt.plot(x, ker_med, linestyle=":", label="kernelUCB (median)")
     plt.fill_between(x, ker_p25, ker_p75, alpha=0.12)
+    for name in LIN_VARIANT_NAMES:
+        plt.plot(x, variant_med[name], linestyle="-.", label=name)
+        plt.fill_between(x, variant_p25[name], variant_p75[name], alpha=0.10)
     plt.xlabel("Rounds")
     plt.ylabel("Cumulative Regret")
     plt.title("Sleep Stage Bandit: Cumulative Regret")
@@ -584,6 +724,12 @@ def main(
     lo = np.clip(ker_wf1_mean - ker_wf1_sd, 0.0, 1.0)
     hi = np.clip(ker_wf1_mean + ker_wf1_sd, 0.0, 1.0)
     plt.fill_between(x, lo, hi, alpha=0.12)
+
+    for name in LIN_VARIANT_NAMES:
+        plt.plot(x, variant_wf1_mean[name], linestyle="-.", label=f"{name} (mean)")
+        lo = np.clip(variant_wf1_mean[name] - variant_wf1_sd[name], 0.0, 1.0)
+        hi = np.clip(variant_wf1_mean[name] + variant_wf1_sd[name], 0.0, 1.0)
+        plt.fill_between(x, lo, hi, alpha=0.10)
 
     plt.xlabel("Rounds")
     plt.ylabel("Rolling Weighted F1")
@@ -630,6 +776,10 @@ def main(
     plt.plot(x, ker_wf1_med, linestyle="-", label="kernelUCB (median)")
     plt.fill_between(x, ker_wf1_p25, ker_wf1_p75, alpha=0.12)
 
+    for name in LIN_VARIANT_NAMES:
+        plt.plot(x, variant_wf1_med[name], linestyle=":", label=f"{name} (median)")
+        plt.fill_between(x, variant_wf1_p25[name], variant_wf1_p75[name], alpha=0.10)
+
     plt.xlabel("Rounds")
     plt.ylabel("Rolling Weighted F1")
     plt.title("Sleep-EDF: Rolling Weighted F1 (window = 200)")
@@ -665,13 +815,13 @@ def main(
     plt.close()
     
     print(f"\nClassification metrics over last {metric_list[0]['n_eval']} rounds:")
-    for name in ["sigUCB", "linUCB", "kernelUCB"]:
+    for name in ["sigUCB", "linUCB", "kernelUCB", *LIN_VARIANT_NAMES]:
         acc = np.array([m[name]["accuracy"] for m in metric_list], dtype=float)
         mf1 = np.array([m[name]["macro_f1"] for m in metric_list], dtype=float)
         wf1 = np.array([m[name]["weighted_f1"] for m in metric_list], dtype=float)
 
         print(
-            f"{name:10s} | "
+            f"{name:14s} | "
             f"acc median={np.median(acc):.3f} "
             f"(p25={np.percentile(acc,25):.3f}, p75={np.percentile(acc,75):.3f}) | "
             f"macro-F1 median={np.median(mf1):.3f} "
@@ -687,7 +837,7 @@ def main(
         "methods": {}
     }
 
-    for name in ["sigUCB", "linUCB", "kernelUCB"]:
+    for name in ["sigUCB", "linUCB", "kernelUCB", *LIN_VARIANT_NAMES]:
         acc = np.array([m[name]["accuracy"] for m in metric_list], dtype=float)
         mf1 = np.array([m[name]["macro_f1"] for m in metric_list], dtype=float)
         wf1 = np.array([m[name]["weighted_f1"] for m in metric_list], dtype=float)
